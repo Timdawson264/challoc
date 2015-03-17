@@ -82,11 +82,11 @@ void chfree(ChunkAllocator* root,void* p) {
      if (!root)
           return;
 
-     /* all memory in this allocator is free already */
-     if (root->current_chunk == 0)
+     if (root->current_chunk < root->n_chunks) {
+         root->chunks[root->current_chunk++] = p;
+     }else{
           push_chunk_to_first_free_stack(root,p);
-     else
-          root->chunks[root->current_chunk++] = p;
+     }
 }
 
 void chclear(ChunkAllocator* root) {
@@ -109,7 +109,7 @@ ChunkAllocator* chcreate(size_t n_chunks, size_t chunk_size) {
      if (!s)
           goto FAIL;
 
-     s->chunks = calloc(n_chunks,sizeof(*s->chunks));
+     s->chunks = calloc(n_chunks,sizeof(*s->chunks)); //TODO: Replace with bitmap
      if (!s->chunks) goto CLEAR1;
 
      s->memory = calloc(n_chunks,chunk_size);
