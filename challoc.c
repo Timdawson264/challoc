@@ -21,30 +21,32 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <math.h>
+#include <tgmath.h>
+
+#define BITMAPSIZE (sizeof(uint64_t)*8)
 
 struct chunk_allocator {
      size_t n_chunks;            /* number of chunks this allocator holds */
      size_t chunk_size;          /* size of single chunk in bytes         */
      size_t free_chunk;          /* Number of free Chunks               */
      ChunkAllocator* next;       /* next allocator, if this one is full         */
-     uint8_t * chunks;     /* bit map of free blocks bit is zero when free     */
+     uint64_t * chunks;     /* bit map of free blocks bit is zero when free     */
      void * memory;      /* challoc returns memory from here      */
 };
 
-static uint8_t getFreeChunkBit(uint8_t * chunks, size_t idx){
+static uint8_t getFreeChunkBit(size_t * chunks, size_t idx){
      size_t byte_sel, bit_sel;
 
-     byte_sel = idx/8; /* which byte */
-     bit_sel  = idx - (byte_sel * 8); /* which bit */
+     byte_sel = idx/BITMAPSIZE; /* which byte */
+     bit_sel  = idx - (byte_sel * BITMAPSIZE); /* which bit */
      return (chunks[byte_sel]>>bit_sel)&0x01;
 }
 
-static void setFreeChunkBit(uint8_t * chunks, size_t idx, uint8_t val){
+static void setFreeChunkBit(size_t * chunks, size_t idx, size_t val){
      size_t byte_sel, bit_sel;
      
-     byte_sel = idx/8;
-     bit_sel  = idx - (byte_sel * 8);
+     byte_sel = idx/BITMAPSIZE;
+     bit_sel  = idx - (byte_sel * BITMAPSIZE);
      /* shift bit to correct location */
      val = (val&0x01)<<bit_sel;
      /* always clear bit then || in the val */
@@ -83,6 +85,31 @@ ChunkAllocator* get_first_allocator_with_free_chunk(ChunkAllocator* start) {
    return NULL;
 }
 
+static size_t get_first_free_chunk(ChunkAllocator* root){
+     size_t i,byte_sel, bit_sel;
+     size_t lookups;
+          
+     /* find the first free chunk in the allocator */
+     byte_sel = (root->n_chunks - root->free_chunk)/BITMAPSIZE; //approx where data will be
+     lookups=0;
+     for(i=0; i<(root->n_chunks/BITMAPSIZE)+1; i++){
+          /* bitmap block has a high bit some where - ie a free chunk */
+          if( root->chunks[byte_sel] ){
+               for(bit_sel=1; bit_sel != 1ull<<63; bit_sel<<=1){
+                    lookups++;
+                    if( root->chunks[byte_sel] & bit_sel ){
+                         if(((byte_sel*BITMAPSIZE)+bit_sel)>root->n_chunks) continue; //rounding err
+                         //fprintf(stderr, "chunk idx: %u, lookups: %u, bit_sel: %u\n",  ((byte_sel*BITMAPSIZE)+bit_sel), i+lookups, bit_sel );
+                         return ((byte_sel*BITMAPSIZE)+log2(bit_sel));
+                    }
+               }
+          }
+          byte_sel = (byte_sel+1) % ((root->n_chunks/BITMAPSIZE)+1);
+     }
+     fprintf(stderr, "chunk idx: %u, lookups: %u, bit_sel: %u\n",  ((byte_sel*BITMAPSIZE)+bit_sel), i+lookups, bit_sel );
+     return -1; //Should never happen
+}
+
 static
 ChunkAllocator* get_allocator_from_chunk(ChunkAllocator* start, void * p){
      ChunkAllocator* iter = NULL;
@@ -95,29 +122,25 @@ ChunkAllocator* get_allocator_from_chunk(ChunkAllocator* start, void * p){
 }
 
 void* challoc(ChunkAllocator* root) {
-     size_t byte_sel, bit_sel;
+     size_t idx;
      void * ptr;
+     
      if (!root)
           return NULL;
 
      root = get_first_allocator_with_free_chunk(root);
+     idx = get_first_free_chunk(root);
 
-     /* find the first free chunk in the allocator */
-     for(byte_sel=0; byte_sel<(root->n_chunks/8)+1; byte_sel++){
-          if( root->chunks[byte_sel] == 0xFF ) continue; //Not free
-
-          for(bit_sel=0; bit_sel<8; bit_sel++){
-               if( root->chunks[byte_sel] & (1<<bit_sel) ) continue; //Not free
-          
-               root->free_chunk--;
-               setFreeChunkBit(root->chunks, (byte_sel*8)+bit_sel, 1); /* mark as not free */
-               ptr = root->memory+(root->chunk_size * ((byte_sel*8)+bit_sel) );
-               //fprintf(stderr, "Challoc: %p\n", ptr );
-               return ptr;
-          }
-     }    
+     if(idx==-1){
+          fprintf(stderr,"-1 free chunk, %u\n", root->free_chunk);
+     }
      
-     return NULL;
+     root->free_chunk--;
+     setFreeChunkBit(root->chunks, idx, 0); /* mark as not free */
+     ptr = root->memory+(root->chunk_size * idx );
+
+     //fprintf(stderr,"challoc: %p, %u\n", ptr, idx);
+     return ptr;
 }
 
 void chfree(ChunkAllocator* root,void* p) {
@@ -131,9 +154,9 @@ void chfree(ChunkAllocator* root,void* p) {
      idx = get_chunkidx_from_pointer(found,p);
 
      //Free the chunk in its allocator
-     setFreeChunkBit(found->chunks, idx, 0);
+     setFreeChunkBit(found->chunks, idx, 1);
      found->free_chunk++;
-     //fprintf(stderr, "Chfree: %p\n", p );
+     //fprintf(stderr, "chfree: %p\n", p );
 }
 
 void chclear(ChunkAllocator* root) {
@@ -145,8 +168,8 @@ void chclear(ChunkAllocator* root) {
 
      for (iter = root; iter; iter = iter->next) {
         iter->free_chunk = iter->n_chunks;
-        for(i=0; i < (iter->n_chunks/8)+1 ; i++){
-             iter->chunks[i] = 0; /* Free all chunks */
+        for(i=0; i < (iter->n_chunks/BITMAPSIZE)+1 ; i++){
+             iter->chunks[i] = -1 ; /* Free all chunks */
         } 
      }
 }
@@ -160,8 +183,8 @@ ChunkAllocator* chcreate(size_t n_chunks, size_t chunk_size) {
      if (!s)
           goto FAIL;
 
-     s->chunks = calloc((n_chunks/8)+1,sizeof(uint8_t)); /*BITMAP 1 bit per chunk*/
-     fprintf(stderr,"bit map is %u bytes\n", (n_chunks/8)+1);
+     s->chunks = calloc((n_chunks/BITMAPSIZE)+1,sizeof(uint64_t)); /*BITMAP 1 bit per chunk*/
+     fprintf(stderr,"bit map is %u block, %u chunks per block\n", (n_chunks/BITMAPSIZE)+1, BITMAPSIZE );
      if (!s->chunks) goto CLEAR1;
 
      s->memory = calloc(n_chunks,chunk_size);
@@ -173,8 +196,8 @@ ChunkAllocator* chcreate(size_t n_chunks, size_t chunk_size) {
      s->next = NULL;
      
      /* Set all chunks free */
-     for(i=0; i< (n_chunks/8)+1 ; i++){
-          s->chunks[i]=0;
+     for(i=0; i< (n_chunks/BITMAPSIZE)+1 ; i++){
+          s->chunks[i]= SIZE_MAX;
      }
 
      return s;
