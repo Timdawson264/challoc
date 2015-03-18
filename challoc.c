@@ -19,22 +19,53 @@
 #include "challoc.h"
 #include <stdlib.h>
 #include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
 
 struct chunk_allocator {
      size_t n_chunks;            /* number of chunks this allocator holds */
      size_t chunk_size;          /* size of single chunk in bytes         */
-     size_t current_chunk;       /* stack pointer in chunks               */
-     ChunkAllocator* next;       /* next allocator, if this one is full   */
-     unsigned char** chunks;     /* stack of free locations in memory     */
-     unsigned char* memory;      /* challoc returns memory from here      */
+     size_t free_chunk;          /* Number of free Chunks               */
+     ChunkAllocator* next;       /* next allocator, if this one is full         */
+     uint8_t * chunks;     /* bit map of free blocks bit is zero when free     */
+     void * memory;      /* challoc returns memory from here      */
 };
+
+static uint8_t getFreeChunkBit(uint8_t * chunks, size_t idx){
+     size_t byte_sel, bit_sel;
+
+     byte_sel = idx/8; /* which byte */
+     bit_sel  = idx - (byte_sel * 8); /* which bit */
+     return (chunks[byte_sel]>>bit_sel)&0x01;
+}
+
+static void setFreeChunkBit(uint8_t * chunks, size_t idx, uint8_t val){
+     size_t byte_sel, bit_sel;
+     
+     byte_sel = idx/8;
+     bit_sel  = idx - (byte_sel * 8);
+     /* shift bit to correct location */
+     val = (val&0x01)<<bit_sel;
+     /* always clear bit then || in the val */
+     chunks[byte_sel] = (chunks[byte_sel] & ~(1<<bit_sel) ) | val;
+}
+
+static size_t get_chunkidx_from_pointer(ChunkAllocator * root, void* ptr){
+     //TODO: Saftey Check
+/*     fprintf(stderr,"chunkIdx - mem: %lu, ptr: %lu, ptr-mem: %u, chunksize: %u, idx: %u\n",
+               root->memory, ptr, root->memory-ptr, ptr-root->memory, root->chunk_size, (ptr-root->memory)/root->chunk_size);
+*/
+     return (ptr-root->memory)/root->chunk_size;
+
+}
 
 static
 ChunkAllocator* get_first_allocator_with_free_chunk(ChunkAllocator* start) {
    ChunkAllocator* iter = NULL;
 
    for (iter = start; iter; iter = iter->next) {
-      if (iter->current_chunk > 0) {
+      if (iter->free_chunk > 0) {
          return iter;
       }
 
@@ -53,50 +84,70 @@ ChunkAllocator* get_first_allocator_with_free_chunk(ChunkAllocator* start) {
 }
 
 static
-void push_chunk_to_first_free_stack(ChunkAllocator* root, void* p) {
-   ChunkAllocator* iter = NULL;
-
-   for (iter = root; iter; iter = iter->next) {
-      if (iter->current_chunk < iter->n_chunks) {
-         iter->chunks[iter->current_chunk++] = p;
-         return;
-      }
-   }
-
-   /* if we get here, there was no room for storing p in any allocator
-    * reachable from root */
-   assert(0);
+ChunkAllocator* get_allocator_from_chunk(ChunkAllocator* start, void * p){
+     ChunkAllocator* iter = NULL;
+     for (iter = start; iter; iter = iter->next) {
+          if( p >= iter->memory && p <= iter->memory+(iter->chunk_size*iter->n_chunks) ){
+               return iter;
+          }
+     }
+     return NULL;
 }
 
 void* challoc(ChunkAllocator* root) {
+     size_t byte_sel, bit_sel;
+     void * ptr;
      if (!root)
           return NULL;
 
      root = get_first_allocator_with_free_chunk(root);
+
+     /* find the first free chunk in the allocator */
+     for(byte_sel=0; byte_sel<(root->n_chunks/8)+1; byte_sel++){
+          if( root->chunks[byte_sel] == 0xFF ) continue; //Not free
+
+          for(bit_sel=0; bit_sel<8; bit_sel++){
+               if( root->chunks[byte_sel] & (1<<bit_sel) ) continue; //Not free
+          
+               root->free_chunk--;
+               setFreeChunkBit(root->chunks, (byte_sel*8)+bit_sel, 1); /* mark as not free */
+               ptr = root->memory+(root->chunk_size * ((byte_sel*8)+bit_sel) );
+               //fprintf(stderr, "Challoc: %p\n", ptr );
+               return ptr;
+          }
+     }    
      
-     return root->chunks[--root->current_chunk];
+     return NULL;
 }
 
-
 void chfree(ChunkAllocator* root,void* p) {
+     ChunkAllocator * found = NULL;
+     size_t idx;
+     
      if (!root)
           return;
 
-     if (root->current_chunk < root->n_chunks) {
-         root->chunks[root->current_chunk++] = p;
-     }else{
-          push_chunk_to_first_free_stack(root,p);
-     }
+     found = get_allocator_from_chunk(root, p);
+     idx = get_chunkidx_from_pointer(found,p);
+
+     //Free the chunk in its allocator
+     setFreeChunkBit(found->chunks, idx, 0);
+     found->free_chunk++;
+     //fprintf(stderr, "Chfree: %p\n", p );
 }
 
 void chclear(ChunkAllocator* root) {
      ChunkAllocator* iter = NULL;
-
+     size_t i;
+     
      if (!root)
           return;
 
      for (iter = root; iter; iter = iter->next) {
-        iter->current_chunk = iter->n_chunks;
+        iter->free_chunk = iter->n_chunks;
+        for(i=0; i < (iter->n_chunks/8)+1 ; i++){
+             iter->chunks[i] = 0; /* Free all chunks */
+        } 
      }
 }
 
@@ -104,26 +155,26 @@ ChunkAllocator* chcreate(size_t n_chunks, size_t chunk_size) {
      ChunkAllocator* s = NULL;
      size_t i;
 
-     s = malloc(sizeof(*s));
+     s = malloc(sizeof(ChunkAllocator));
 
      if (!s)
           goto FAIL;
 
-     s->chunks = calloc(n_chunks,sizeof(*s->chunks)); //TODO: Replace with bitmap
+     s->chunks = calloc((n_chunks/8)+1,sizeof(uint8_t)); /*BITMAP 1 bit per chunk*/
+     fprintf(stderr,"bit map is %u bytes\n", (n_chunks/8)+1);
      if (!s->chunks) goto CLEAR1;
 
      s->memory = calloc(n_chunks,chunk_size);
      if (!s->memory) goto CLEAR2;
      
      s->n_chunks = n_chunks;
+     s->free_chunk = n_chunks;
      s->chunk_size = chunk_size;
-     s->current_chunk = 0;
      s->next = NULL;
      
-     /* add locations in s->memory to the stack of free chunks */
-     while (s->current_chunk < s->n_chunks) {
-          s->chunks[s->current_chunk] = &s->memory[s->current_chunk * chunk_size];
-          s->current_chunk++;
+     /* Set all chunks free */
+     for(i=0; i< (n_chunks/8)+1 ; i++){
+          s->chunks[i]=0;
      }
 
      return s;
@@ -174,7 +225,7 @@ int main(int argc, char** argv) {
      ChunkAllocator* nodes = chcreate(NODE_COUNT,sizeof(struct point_list));
 
      assert(nodes                                             );
-     assert(nodes->current_chunk == NODE_COUNT                );
+     assert(nodes->free_chunk    == NODE_COUNT                );
      assert(nodes->n_chunks      == NODE_COUNT                );
      assert(nodes->chunk_size    == sizeof(struct point_list) );
      assert(nodes->next          == NULL                      );
@@ -210,12 +261,12 @@ int main(int argc, char** argv) {
       */
 
      assert(nodes->next                                      );
-     assert(nodes->next->current_chunk == NODE_COUNT - 1     );
+     assert(nodes->next->free_chunk == NODE_COUNT - 1     );
      assert(nodes->next->n_chunks      == NODE_COUNT         );
      assert(nodes->next->chunk_size    == nodes->chunk_size  );
      assert(nodes->next->next          == NULL               );
 
-     assert(nodes->current_chunk == 0);
+     assert(nodes->free_chunk == 0);
 
      chdestroy(&nodes);
 
